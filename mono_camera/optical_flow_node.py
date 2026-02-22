@@ -103,7 +103,7 @@ class OpticalFlowNode(Node):
         # === PUBLISHERS ===
         self.speed_pub = self.create_publisher(Float32, '/optical_flow/speed', 10)
         self.speed_comp_pub = self.create_publisher(Vector3, '/optical_flow/speed_comp', 10)
-        self.image_pub = self.create_publisher(Image, '/optical_flow/annotated_image', 10)
+        #self.image_pub = self.create_publisher(Image, '/optical_flow/annotated_image', 10)
 
         # === OPTICAL FLOW STATE ===
         self.prev_gray = None
@@ -206,12 +206,12 @@ class OpticalFlowNode(Node):
         # Convert ROS image to OpenCV
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, bright_mask = cv2.threshold(frame_gray, 220, 255, cv2.THRESH_BINARY)
+        bright_mask = cv2.bitwise_not(bright_mask)
         
         if(self.CLAHE_ENABLE):
             # Pre-Processing
             frame_gray = self.clahe.apply(frame_gray)
-            _, bright_mask = cv2.threshold(frame_gray, 220, 255, cv2.THRESH_BINARY)
-            bright_mask = cv2.bitwise_not(bright_mask)
 
         # Initialize first frame
         if self.prev_gray is None:
@@ -220,7 +220,7 @@ class OpticalFlowNode(Node):
             if self.p0 is None:
                 self.p0 = np.empty((0, 1, 2), dtype=np.float32)
             self.prev_dirs = np.zeros_like(self.p0)
-            self.mask = np.zeros_like(frame)
+            #self.mask = np.zeros_like(frame)
             return
 
         # --- Calculate optical flow ---
@@ -237,7 +237,7 @@ class OpticalFlowNode(Node):
         stacked_weights = []
 
         # --- Reset mask fade ---
-        self.mask = cv2.addWeighted(self.mask, self.ALPHA, np.zeros_like(self.mask), 1 - self.ALPHA, 0)
+        #self.mask = cv2.addWeighted(self.mask, self.ALPHA, np.zeros_like(self.mask), 1 - self.ALPHA, 0)
 
         # Update prev_dirs to match the number of good points
         # This needs to happen BEFORE the loop
@@ -278,28 +278,31 @@ class OpticalFlowNode(Node):
             if mag < 0.05:
                 continue
 
+            """
             # Smooth direction
             if idx < len(new_prev_dirs):
                 prev_dx_px, prev_dy_px = new_prev_dirs[idx][0]
                 dx_px = self.DIRECTION_SMOOTH * prev_dx_px + (1 - self.DIRECTION_SMOOTH) * dx_px
                 dy_px = self.DIRECTION_SMOOTH * prev_dy_px + (1 - self.DIRECTION_SMOOTH) * dy_px
                 new_prev_dirs[idx] = [[dx_px, dy_px]]
-
+            
+            
             # Draw arrow
             end_x, end_y = int(c + 3 * dx_px), int(d + 3 * dy_px)
             cv2.arrowedLine(self.mask, (int(c), int(d)), (end_x, end_y), (0, 255, 0), 2, tipLength=0.3)
 
             stacked_metric_vel.append([vx, vy])
             weight = 1.0 / (error + 1e-6)
-            stacked_weights.append(weight)
+            stacked_weights.append(weight)  
+            """    
 
-        self.prev_dirs = new_prev_dirs
+        #self.prev_dirs = new_prev_dirs
 
         # --- Blend and publish annotated frame ---
-        output = cv2.addWeighted(frame, 0.8, self.mask, 0.7, 0)
-        msg_out = self.bridge.cv2_to_imgmsg(output, encoding='bgr8')
-        msg_out.header.stamp = self.get_clock().now().to_msg()
-        self.image_pub.publish(msg_out)
+        #output = cv2.addWeighted(frame, 0.8, self.mask, 0.7, 0)
+        #msg_out = self.bridge.cv2_to_imgmsg(output, encoding='bgr8')
+        #msg_out.header.stamp = self.get_clock().now().to_msg()
+        #self.image_pub.publish(msg_out)
 
         # Use Least-Squares
         if len(stacked_metric_vel) > 0:
@@ -333,9 +336,9 @@ class OpticalFlowNode(Node):
 
         # --- Re-detect features if needed ---
         if self.frame_idx % self.REDETECT_INTERVAL == 0 or len(self.p0) < 30:
-            new_points = cv2.goodFeaturesToTrack(frame_gray, mask=None, **self.feature_params)
+            new_points = cv2.goodFeaturesToTrack(frame_gray, mask=bright_mask, **self.feature_params)
             if new_points is not None:
-                self.p0 = np.vstack((self.p0, new_points))
+                self.p0 = new_points
                 self.prev_dirs = np.zeros_like(self.p0)
 
 def main(args=None):
