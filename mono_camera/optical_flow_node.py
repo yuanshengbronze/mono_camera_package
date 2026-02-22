@@ -156,7 +156,7 @@ class OpticalFlowNode(Node):
         if self.prev_depth_t is not None:
             dt = t - self.prev_depth_t
             if 1e-4 < dt < 1.0:
-                vz = -(z - self.prev_depth_m) / dt
+                vz = (z - self.prev_depth_m) / dt
         
         self.prev_depth_t = t
         self.prev_depth_m = z
@@ -208,13 +208,15 @@ class OpticalFlowNode(Node):
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
         if(self.CLAHE_ENABLE):
-            # Pre-Processing with CLAHE
+            # Pre-Processing
             frame_gray = self.clahe.apply(frame_gray)
+            _, bright_mask = cv2.threshold(frame_gray, 220, 255, cv2.THRESH_BINARY)
+            bright_mask = cv2.bitwise_not(bright_mask)
 
         # Initialize first frame
         if self.prev_gray is None:
             self.prev_gray = frame_gray
-            self.p0 = cv2.goodFeaturesToTrack(frame_gray, mask=None, **self.feature_params)
+            self.p0 = cv2.goodFeaturesToTrack(frame_gray, mask=bright_mask, **self.feature_params)
             if self.p0 is None:
                 self.p0 = np.empty((0, 1, 2), dtype=np.float32)
             self.prev_dirs = np.zeros_like(self.p0)
