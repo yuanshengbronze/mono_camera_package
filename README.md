@@ -1,6 +1,8 @@
-Optical Flow based velocity estimation for ROS2. Yaw effects are accounted for. 
+Optical Flow based velocity estimation for ROS2. Yaw effects are accounted for, roll and pitch are ignored. 
 
 How to Use:
+
+make sure launch.py has the correct path for the camera info
 
 run depth, image, and rpy publishers (depth, image_proc, rpy)
 
