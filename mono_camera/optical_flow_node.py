@@ -16,8 +16,7 @@ class OpticalFlowNode(Node):
         super().__init__('optical_flow_node')
 
         # === PARAMETERS ===
-        # ros2 run mono_camera optical_flow_node --ros-args \
-        #   -p clahe.clip_limit:=3.0 -p clahe.tile_x:=8 -p clahe.tile_y:=8
+        # ros2 run mono_camera optical_flow_node --ros-args \-p clahe.clip_limit:=3.0 -p clahe.tile_x:=8 -p clahe.tile_y:=8
         
         # Scene / geometry
         self.declare_parameter('pool_depth', 2.0)
@@ -147,7 +146,7 @@ class OpticalFlowNode(Node):
         return best
         
     def depth_callback(self, msg: Float32Stamped):
-        z = float(msg.data)
+        z = float(msg.value)
         if z <= 0.0 or np.isnan(z) or np.isinf(z):
            return
         

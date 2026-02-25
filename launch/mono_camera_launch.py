@@ -13,7 +13,7 @@ def generate_launch_description():
                 'device' : '/dev/video0',
                 'pixel_format' : 'YUYV',
                 'image_size' : [640,480], 
-                'camera_info_url': 'file:///home/yqzzy/ros2_ws/src/mono_camera/camera_info/ost.yaml',
+                'camera_info_url': 'file:///home/aa/mono_cam/src/mono_camera_package-modified/camera_info/ost.yaml',
                 'output_camera_info_from_camera': True
             }]
         ),
