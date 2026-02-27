@@ -3,7 +3,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float32
 from cv_bridge import CvBridge
-from marti_common_msgs.msg import Float32Stamped
 from geometry_msgs.msg import Vector3Stamped
 from collections import deque
 from geometry_msgs.msg import Vector3
@@ -16,8 +15,7 @@ class OpticalFlowNode(Node):
         super().__init__('optical_flow_node')
 
         # === PARAMETERS ===
-        # ros2 run mono_camera optical_flow_node --ros-args \
-        #   -p clahe.clip_limit:=3.0 -p clahe.tile_x:=8 -p clahe.tile_y:=8
+        # ros2 run mono_camera optical_flow_node --ros-args \-p clahe.clip_limit:=3.0 -p clahe.tile_x:=8 -p clahe.tile_y:=8
         
         # Scene / geometry
         self.declare_parameter('pool_depth', 2.0)
@@ -64,8 +62,8 @@ class OpticalFlowNode(Node):
         
         # === VARIABLES ===
         self.last_img_t = None
-        self.prev_depth_t = None
         self.prev_depth_m = None
+        self.depth_last_t = None   # local receipt time
         self.prev_yaw_t = None
         self.prev_yaw = None
         self.depth_m = None
@@ -120,7 +118,7 @@ class OpticalFlowNode(Node):
         )
 
         self.depth_sub = self.create_subscription(
-            Float32Stamped,
+            Float32,
             '/depth',
             self.depth_callback,
             10
@@ -161,9 +159,7 @@ class OpticalFlowNode(Node):
         )
 
         # === Time Buffers ===
-        self.depth_buffer = deque(maxlen=30)
         self.rpy_buffer = deque(maxlen=30)
-        self.MAX_DEPTH_SKEW = 0.08
         self.MAX_RPY_SKEW = 0.08
 
         self.get_logger().info("Optical Flow Node started.")
@@ -198,11 +194,6 @@ class OpticalFlowNode(Node):
         decomposing the inter-frame homography (valid for a planar scene).
 
         Returns w_yaw_vision (rad/s) or None if estimation fails.
-
-        Convention: Z positive downward (camera facing the pool floor).
-        For a downward-facing camera, yaw rotates around the Z axis.
-        The returned value is positive for counter-clockwise rotation when
-        viewed from above (i.e. w_yaw > 0 → vehicle turns left in NED/body).
         """
         if len(pts_old) < 4 or len(pts_new) < 4:
             return None
@@ -213,38 +204,26 @@ class OpticalFlowNode(Node):
         if inliers is None or int(inliers.sum()) < self.YAW_MIN_INLIERS:
             return None
 
-        # Decompose homography into rotation / translation / plane normal.
-        # cv2.decomposeHomographyMat returns up to 4 solution sets.
         num, Rs, Ts, Ns = cv2.decomposeHomographyMat(H, self.K)
 
-        # Select the decomposition where the plane normal points *toward* the
-        # camera, i.e. N_z < 0 in camera frame (floor is below the camera and
-        # the normal of the floor points upward, which is -Z in camera coords).
         best_R = None
         for i in range(num):
             n = Ns[i].flatten()
-            if n[2] < 0:          # normal pointing toward camera (up)
+            if n[2] < 0:
                 best_R = Rs[i]
                 break
 
         if best_R is None:
-            # Fallback: pick solution with normal closest to -Z
             best_R = Rs[int(np.argmin([Ns[i][2] for i in range(num)]))]
 
-        # Extract yaw (rotation about Z axis) from the rotation matrix.
-        # For small angles: R ≈ [[cos θ, -sin θ, 0], [sin θ, cos θ, 0], [0, 0, 1]]
         yaw_delta = np.arctan2(best_R[1, 0], best_R[0, 0])
         w_yaw_vision = yaw_delta / dt
         return float(w_yaw_vision)
 
     def _estimate_yaw_rate_flow_curl(self, pts_old, pts_new, dt):
         """
-        Lightweight fallback: estimate yaw rate from the curl (rotational
-        component) of the optical flow field via least squares.
-
-        For pure yaw w around Z, the induced normalised flow is:
-            dx_norm = -w * y_norm * dt
-            dy_norm =  w * x_norm * dt
+        Lightweight fallback: estimate yaw rate from the curl of the optical
+        flow field via least squares.
         """
         A, b = [], []
         for new, old in zip(pts_new, pts_old):
@@ -254,9 +233,9 @@ class OpticalFlowNode(Node):
             ynorm = (ay - self.CY) / self.FY
             dx_norm = (ax - cx) / self.FX
             dy_norm = (ay - cy) / self.FY
-            A.append([ xnorm * dt])   # from dy_norm =  w * xnorm * dt
+            A.append([ xnorm * dt])
             b.append(  dy_norm      )
-            A.append([-ynorm * dt])   # from dx_norm = -w * ynorm * dt
+            A.append([-ynorm * dt])
             b.append(  dx_norm      )
 
         A = np.array(A)
@@ -267,8 +246,7 @@ class OpticalFlowNode(Node):
     def _fuse_yaw_rate(self, w_yaw_imu, pts_old, pts_new, dt):
         """
         Attempt homography-based yaw estimation and fuse with IMU yaw rate
-        via a complementary filter.  Falls back to flow-curl if homography
-        decomposition fails, and to IMU-only if everything else fails.
+        via a complementary filter.
         """
         w_yaw_vision = self._estimate_yaw_rate_homography(pts_old, pts_new, dt)
 
@@ -278,7 +256,6 @@ class OpticalFlowNode(Node):
         if w_yaw_vision is None:
             return w_yaw_imu
 
-        # Complementary filter: trust vision for slow/DC, IMU for fast transients
         alpha = self.YAW_VISION_ALPHA
         return alpha * w_yaw_vision + (1.0 - alpha) * w_yaw_imu
 
@@ -286,28 +263,26 @@ class OpticalFlowNode(Node):
     # CALLBACKS
     # =========================================================================
         
-    def depth_callback(self, msg: Float32Stamped):
+    def depth_callback(self, msg: Float32):
         z = float(msg.data)
+
         if z <= 0.0 or np.isnan(z) or np.isinf(z):
-           return
-        
-        t = self._stamp_to_sec(msg.header.stamp)
-        vz = 0.0
-        if self.prev_depth_t is not None:
-            dt = t - self.prev_depth_t
+            return
+
+        now = self.get_clock().now().nanoseconds * 1e-9
+
+        if self.depth_last_t is not None and self.depth_m is not None:
+            dt = now - self.depth_last_t
             if 1e-4 < dt < 1.0:
-                # Convention: Z positive downward.
-                # vz > 0 means vehicle moving downward (toward pool floor).
-                vz = (z - self.prev_depth_m) / dt
-        
-        self.prev_depth_t = t
-        self.prev_depth_m = z
-        self.depth_buffer.append((t, z, vz))
+                self.vz = (z - self.depth_m) / dt
+
+        self.depth_m = z
+        self.depth_last_t = now
     
     def rpy_callback(self, msg: Vector3Stamped):
-        r = float(msg.vector.x)
-        p = float(msg.vector.y)
-        y = float(msg.vector.z)
+        r = np.deg2rad(float(msg.vector.x))
+        p = np.deg2rad(float(msg.vector.y))
+        y = np.deg2rad(float(msg.vector.z))
         t = self._stamp_to_sec(msg.header.stamp)
 
         w_yaw = 0.0
@@ -336,11 +311,10 @@ class OpticalFlowNode(Node):
             return
         
         # --- Sync depth and RPY to image timestamp ---
-        depth_entry = self._nearest(self.depth_buffer, t, self.MAX_DEPTH_SKEW)
-        rpy_entry   = self._nearest(self.rpy_buffer,   t, self.MAX_RPY_SKEW)
-        if depth_entry is None or rpy_entry is None:
+        rpy_entry   = self._nearest(self.rpy_buffer, t, self.MAX_RPY_SKEW)
+        if self.depth_m is None or rpy_entry is None:
             return
-        _, self.depth_m, vz      = depth_entry
+        vz = float(self.vz)
         _, self.roll, self.pitch, self.yaw, w_yaw_imu = rpy_entry
         
         # --- Convert to grayscale + optional CLAHE ---
@@ -362,21 +336,30 @@ class OpticalFlowNode(Node):
             self.mask = np.zeros_like(frame)
             return
 
+        # Guard: need at least 1 point to track
+        if self.p0 is None or len(self.p0) == 0:
+            self.p0 = cv2.goodFeaturesToTrack(frame_gray, mask=detect_mask, **self.feature_params)
+            if self.p0 is None:
+                self.p0 = np.empty((0, 1, 2), dtype=np.float32)
+            self.prev_dirs = np.zeros_like(self.p0)
+            self.prev_gray = frame_gray.copy()
+            return
+
         # =====================================================================
         # OPTICAL FLOW  (forward pass)
+        # NOTE: Do NOT use cv2.OPTFLOW_USE_INITIAL_FLOW when passing None as
+        # the initial guess for p1 — that flag requires p1 to be pre-filled.
         # =====================================================================
         p1, st, err = cv2.calcOpticalFlowPyrLK(
             self.prev_gray, frame_gray, self.p0, None,
-            flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
             **self.lk_params
         )
         if p1 is None or st is None or err is None:
+            self.prev_gray = frame_gray.copy()
             return
 
         # =====================================================================
         # FORWARD-BACKWARD CONSISTENCY CHECK
-        # Discard points whose back-tracked position differs from the original
-        # by more than FB_THRESHOLD pixels.
         # =====================================================================
         p_back, st_back, _ = cv2.calcOpticalFlowPyrLK(
             frame_gray, self.prev_gray, p1, None, **self.lk_params
@@ -384,8 +367,8 @@ class OpticalFlowNode(Node):
         if p_back is not None and st_back is not None:
             fb_error = np.linalg.norm(
                 self.p0 - p_back, axis=2
-            ).squeeze(axis=1)                       # shape (N,)
-            fb_ok = (fb_error < self.FB_THRESHOLD)  # shape (N,)
+            ).squeeze(axis=1)
+            fb_ok = (fb_error < self.FB_THRESHOLD)
         else:
             fb_ok = np.ones(len(self.p0), dtype=bool)
 
@@ -432,8 +415,6 @@ class OpticalFlowNode(Node):
             a, b = new.ravel()
             c, d = old.ravel()
 
-            # Distance from camera to pool floor (Z positive downward).
-            # depth_m = vehicle depth from surface; pool floor is at POOL_DEPTH.
             Z_m = self.POOL_DEPTH - self.depth_m
             if Z_m <= 0:
                 continue
@@ -446,17 +427,22 @@ class OpticalFlowNode(Node):
             dxnorm = dx_px / self.FX
             dynorm = dy_px / self.FY
 
-            # 3-D position in camera frame
+            # CAMERA COORDINATES
             X = xnorm * Z_m
             Y = ynorm * Z_m
 
-            # AUV translational velocity in camera / body frame.
-            # Optical flow equation (planar, Z+ downward):
-            #   dxnorm/dt = -vx/Z  + xnorm*vz/Z  + w_yaw*ynorm  (approx, small angles)
-            #   dynorm/dt = -vy/Z  + ynorm*vz/Z  - w_yaw*xnorm
-            # Solving for vx, vy:
-            vx = -dxnorm / dt * Z_m + xnorm * vz - w_yaw * Y
-            vy = -dynorm / dt * Z_m + ynorm * vz + w_yaw * X
+            # Optical flow → AUV translational velocity
+            # Camera v-axis maps to AUV X (forward):
+            #   dynorm/dt = -V_auv_x/Z + ynorm*vz/Z  →  V_auv_x = -dynorm/dt*Z + ynorm*vz
+            # Camera u-axis maps to AUV Y (port):
+            #   dxnorm/dt = -V_auv_y/Z + xnorm*vz/Z  →  V_auv_y = -dxnorm/dt*Z + xnorm*vz
+            #
+            # Yaw correction: apparent flow due to body rotation ω×r is subtracted.
+            # ω = (0, 0, w_yaw) in AUV frame, r = (X_auv, Y_auv):
+            #   v_rot_auv_x =  w_yaw * Y_auv
+            #   v_rot_auv_y = -w_yaw * X_auv
+            vx = -dynorm / dt * Z_m + ynorm * vz - w_yaw * X
+            vy = dxnorm / dt * Z_m - xnorm * vz - w_yaw * Y
 
             mag = np.sqrt(vx**2 + vy**2)
             if mag < 0.05:
@@ -508,13 +494,14 @@ class OpticalFlowNode(Node):
                 w = w[inlier_mask]
 
             if len(V) == 0:
+                # Still update state before returning
+                self._update_state(frame_gray, good_new, detect_mask)
                 return
 
-            # Weighted mean (closed-form WLS since all rows map to same unknowns)
             v_uav_x = np.sum(w * V[:, 0]) / np.sum(w)
             v_uav_y = np.sum(w * V[:, 1]) / np.sum(w)
 
-            # --- EMA smoothing on output velocity ---
+            # EMA smoothing
             a = self.ema_alpha
             self.ema_vx = a * v_uav_x + (1.0 - a) * self.ema_vx
             self.ema_vy = a * v_uav_y + (1.0 - a) * self.ema_vy
@@ -540,19 +527,27 @@ class OpticalFlowNode(Node):
         # =====================================================================
         # UPDATE STATE FOR NEXT FRAME
         # =====================================================================
+        self._update_state(frame_gray, good_new, detect_mask)
+
+    def _update_state(self, frame_gray, good_new, detect_mask):
+        """Update tracking state and re-detect features if needed."""
         self.prev_gray = frame_gray.copy()
-        self.p0        = good_new.reshape(-1, 1, 2)
-        # Wrap frame counter to avoid overflow on long runs
+        self.p0        = good_new.reshape(-1, 1, 2) if len(good_new) > 0 else np.empty((0, 1, 2), dtype=np.float32)
         self.frame_idx = (self.frame_idx + 1) % self.REDETECT_INTERVAL
 
-        # --- Periodic / low-count re-detection ---
+        # Periodic / low-count re-detection
         if self.frame_idx == 0 or len(self.p0) < 30:
             new_points = cv2.goodFeaturesToTrack(
                 frame_gray, mask=detect_mask, **self.feature_params
             )
             if new_points is not None:
-                self.p0        = np.vstack((self.p0, new_points))
-                self.prev_dirs = np.zeros_like(self.p0)
+                if len(self.p0) > 0:
+                    # Append only genuinely new points (not near existing ones)
+                    self.p0 = np.vstack((self.p0, new_points))
+                else:
+                    self.p0 = new_points
+            # Reset prev_dirs to match the (possibly updated) point count
+            self.prev_dirs = np.zeros((len(self.p0), 1, 2), dtype=np.float32)
 
 
 def main(args=None):
